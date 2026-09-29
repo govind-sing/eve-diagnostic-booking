@@ -109,17 +109,164 @@ routes unaffected.
 **Verified:** app imports cleanly with all booking routes registered
 alongside auth, centres, and tests.
 
-### Payment Resolution & Idempotency
+## Step 4 — Payment service and idempotent webhook
 
-Key design: one shared `_apply_payment_result` function handles both the synchronous "gateway response" in `POST /payments/` and the async `POST /payments/webhook/`.
+**What was built:**
+- `Payment` model: `booking_id`, `event_id` (unique, the idempotency key),
+  `status` (`PENDING`/`SUCCESS`/`FAILED`), `amount`, `created_at`.
+- `_apply_payment_result(payment, new_status, db)` — the single function that
+  moves a payment from `PENDING` to a terminal state and syncs the booking
+  (`CONFIRMED` on `SUCCESS`, `FAILED` on `FAILED`). It's a no-op if the
+  payment is already terminal, whatever status is passed in.
+- `POST /payments/` — booking owner only, `409` if the booking isn't
+  `PENDING`. Creates a `Payment` with a server-generated `event_id`, then
+  immediately calls `_apply_payment_result` with a random `SUCCESS`/`FAILED`
+  outcome to simulate the gateway's synchronous response.
+- `POST /payments/webhook/` — looks up the payment by `event_id` (`404` if
+  unknown), then calls the same `_apply_payment_result`. Matches the
+  assignment's exact path.
+- Migration `97d4ff5740cf`: `payment_status` enum + `payments` table with a
+  unique index on `event_id`.
 
-It only mutates state when the payment is still `PENDING` — so a replayed webhook, even with a conflicting status, is a guaranteed no-op.
+**Decisions made:**
+- **Idempotency key on a unique column** (user's call) over a booking-status
+  check — `event_id` is unique at the database level, so even a race between
+  two concurrent identical webhook deliveries can't both "win"; the shared
+  resolver function is what prevents a conflicting second delivery from
+  altering an already-resolved payment.
+- **One shared resolver for both the synchronous payment call and the
+  webhook** — rather than duplicating the SUCCESS/FAILED handling logic in
+  two places, `POST /payments/` and `POST /payments/webhook/` both go through
+  `_apply_payment_result`. This guarantees identical idempotency behavior
+  regardless of which path a given event's outcome comes through, and there
+  is exactly one place that can transition a booking based on a payment
+  result.
+- **Conflicting replay is silently ignored, not rejected with an error** —
+  if a webhook reports a different status than what's already recorded, the
+  existing terminal state wins and the call still returns `200` with the
+  actual current state. This avoids the webhook sender interpreting an error
+  response as "retry me," which could otherwise turn into a retry loop.
+- **Webhook left unauthenticated** — no JWT applies to a server-to-server
+  callback with no user context; flagged in the README that a real system
+  would verify a provider signature instead.
+- **`POST /payments/webhook/` path matches the assignment exactly** (trailing
+  slash included), verified by inspecting the app's registered routes
+  directly rather than assuming FastAPI's default redirect behavior would
+  paper over a mismatch.
 
-`event_id` also has a unique DB constraint, so two truly concurrent duplicate deliveries can't both slip through.
+**Verified:** app imports cleanly with all payment routes registered at the
+exact spec'd paths. Ran the idempotency logic in isolation against an
+in-memory database: first resolution applies correctly, a replay with the
+same status is a no-op, a replay with a conflicting status does not alter the
+already-resolved payment or booking, and a duplicate `event_id` insert is
+rejected by the unique constraint.
 
-I stress-tested that resolver against an in-memory DB before writing this up:
+## Step 5 — Fixing bugs found on first real end-to-end run
 
-- First resolution applies correctly.
-- Same-status replay is a no-op.
-- Conflicting-status replay leaves the original result untouched.
-- A duplicate `event_id` insert is rejected outright by the unique constraint.
+With Docker unavailable in my own environment, I installed Postgres directly
+and ran the actual app against it for the first time here, then had the user
+run `docker compose up` + `test.sh` on their machine. Two real bugs surfaced:
+
+1. **`test.sh` failed entirely on macOS's default bash 3.2** — expanding an
+   empty array (`"${auth_header[@]}"`) under `set -u` is a known bash <4.4
+   bug ("unbound variable"). Fixed by building the curl invocation as
+   conditional branches instead of an array, and dropping `set -u`/`set -e`
+   entirely (the script is meant to run every check and report a full
+   summary, not abort on the first failure).
+2. **`POST /auth/signup` returned 500** — two independent causes, both real:
+   - SQLAlchemy's `Enum` type sends a Python enum member's **name** to the
+     database by default, not its **value**. `BookingStatus`/`PaymentStatus`
+     happened to work because their member names equal their values
+     (`PENDING = "PENDING"`), but `UserRole` didn't (`ADMIN = "admin"`), so
+     every insert tried `'ADMIN'`/`'PATIENT'` against a Postgres enum that
+     only accepts `'admin'`/`'patient'`. Fixed with `values_callable` on the
+     `role` column in `app/models/user.py`.
+   - `passlib[bcrypt]==1.7.4` is incompatible with `bcrypt>=4.1` (an upstream
+     compatibility break: passlib's internal self-test throws a "password
+     cannot be longer than 72 bytes" error that has nothing to do with the
+     actual password). Fixed by pinning `bcrypt==4.0.1` in `requirements.txt`.
+
+**Verified:** ran the full `test.sh` suite against a real Postgres instance
+(not sqlite) five times in a row after both fixes — 33/33 checks pass every
+time, including both branches of the random payment outcome (`SUCCESS` and
+`FAILED`).
+
+**Also caught and fixed earlier (before handing off Docker files):** the
+`booking_status`/`payment_status` Alembic migrations were calling
+`.create(checkfirst=True)` on the enum type explicitly, and then
+`op.create_table` tried to create the same type again unconditionally,
+causing `DuplicateObject` errors. Fixed by removing the redundant explicit
+call for `create_table`-based migrations (the table creation creates the type
+once, correctly); the `add_column`-based migration (`user_role`) still needs
+the explicit call, since `add_column` does not auto-create enum types the way
+`create_table` does.
+
+## Step 6 — pytest suite (the graded "Tests" line item)
+
+**What was built:** `tests/` — a pytest suite using FastAPI's `TestClient`
+against a real SQLite database (one fresh file per test, via a `get_db`
+dependency override), separate from `test.sh`'s HTTP-level smoke test against
+a running instance.
+
+- `tests/conftest.py` — `db_session`/`client` fixtures, plus shared
+  `admin_token`/`patient_token`/`other_patient_token`/`centre_and_test`
+  fixtures reused across modules.
+- `tests/test_auth.py` — signup defaults/roles, duplicate email, password
+  length, invalid email, login success/failure.
+- `tests/test_centres_and_tests.py` — admin-only writes, public reads, 404s,
+  price/location updates, filtering.
+- `tests/test_bookings.py` — booking creation, past-date rejection,
+  test/centre mismatch, ownership enforcement, cancellation states, **and a
+  dedicated test that an admin price change after booking does not alter the
+  booking's snapshotted `amount`** (directly verifies the Step 3 decision).
+- `tests/test_payments.py` — both payment outcomes (gateway randomness
+  patched deterministic via `monkeypatch`), the idempotent webhook (same
+  status is a no-op, conflicting status doesn't corrupt state), unknown
+  event 404, and a test hitting the underlying unique constraint on
+  `event_id` directly, independent of the route-level logic.
+- `requirements-dev.txt` (`-r requirements.txt` + `pytest`, `httpx`) and
+  `pytest.ini` (`pythonpath = .`) so `app`/`tests` resolve regardless of
+  where pytest is invoked from.
+
+**A real bug this caught:** `get_current_user` (`app/api/deps.py`) compared
+`User.id == user_id` where `user_id` was the raw string from the JWT's `sub`
+claim, not a `uuid.UUID`. Postgres's UUID column accepts a plain string
+directly, so this worked fine in every manual/`test.sh` run against real
+Postgres — but SQLite's UUID handling requires an actual `uuid.UUID` object
+and throws `AttributeError: 'str' object has no attribute 'hex'` on a bare
+string. This was a genuine portability bug in the code, not a testing
+artifact. Fixed by explicitly parsing the JWT subject into a `uuid.UUID`
+(with a `401`, not a `500`, on a malformed value) before querying. Also fixed
+the same class of bug in `test_duplicate_event_id_rejected_at_db_level`
+itself (comparing `Booking.id` to a raw JSON string).
+
+**Decisions made:**
+- **SQLite over a second Postgres instance for pytest** — keeps the unit
+  test suite fast and dependency-free (no Docker/Postgres required to run
+  `pytest`), while `test.sh` remains the real-Postgres, real-deployment
+  check. The tradeoff: SQLite doesn't enforce the Postgres-specific `ENUM`
+  types or catch Postgres-only SQL issues, which is exactly why `test.sh`
+  against the actual Docker stack still matters as a separate check — and
+  is exactly how the `get_current_user` bug above surfaced despite `test.sh`
+  passing 33/33 against Postgres.
+- **`monkeypatch` on `random.choice`** for payment tests, rather than
+  running many iterations and hoping to see both outcomes — deterministic
+  and explicit about which branch each test covers.
+- **A dedicated price-snapshot test** rather than relying on `test.sh` or
+  manual inspection — this decision (Step 3) has no other automated
+  coverage otherwise, and it's exactly the kind of regression a future
+  change could silently reintroduce.
+
+**Verified:** `pytest -v` → 38 passed. Also reran `test.sh` against real
+Postgres after the `deps.py` fix → still 33/33, confirming the fix changes
+nothing about Postgres behavior.
+
+One follow-up: the first attempt to hand off the `deps.py` fix used a partial
+diff instead of the full file, and the same raw-string-vs-`uuid.UUID` bug was
+still present in `test_duplicate_event_id_rejected_at_db_level` itself
+(comparing `Booking.id` to a raw JSON string, not the app code). Fixed by
+wrapping the JSON id in `UUID(...)` before the query, and confirmed
+independently on the actual project machine (not just this build
+environment): `pytest -v` → **38 passed, 0 failed**. Lesson applied going
+forward: hand off full files, not diffs, whenever a change touches more than
+one line.
