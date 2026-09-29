@@ -25,7 +25,7 @@ This is the fastest way to get the whole stack running, no local Python or
 Postgres install required — only Docker.
 
 ```bash
-git clone <this-repo-url>
+git clone https://github.com/govind-sing/eve-diagnostic-booking
 cd eve-diagnostic-booking
 
 docker compose up --build -d
