@@ -20,6 +20,12 @@ class User(Base):
     hashed_password = Column(String, nullable=False)
     full_name = Column(String, nullable=True)
     role = Column(
-        Enum(UserRole, name="user_role"), nullable=False, default=UserRole.PATIENT
+        Enum(
+            UserRole,
+            name="user_role",
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
+        ),
+        nullable=False,
+        default=UserRole.PATIENT,
     )
     created_at = Column(DateTime(timezone=True), server_default=func.now())

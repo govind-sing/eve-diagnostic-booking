@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 
-from app.api.routes import auth
+from app.api.routes import auth, centres, tests, booking, payments
 
 app = FastAPI(
     title="EVE Healthcare - Diagnostic Booking Service",
@@ -9,6 +9,10 @@ app = FastAPI(
 )
 
 app.include_router(auth.router)
+app.include_router(centres.router)
+app.include_router(tests.router)
+app.include_router(booking.router)
+app.include_router(payments.router)
 
 
 @app.get("/health", tags=["health"])
